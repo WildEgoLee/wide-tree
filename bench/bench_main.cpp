@@ -304,6 +304,7 @@ void printRow(const Row& row) {
               static_cast<unsigned long long>(row.segmentBytes), row.buildUs, row.query.rows64,
               row.query.rowRef, row.query.rowOf, row.query.iters, row.toggle.expand, row.toggle.collapse,
               row.toggle.iters);
+  std::fflush(stdout);
 }
 
 Row runWide(const char* shape, std::uint32_t fanout, std::uint32_t splits, widetree::NodeId target) {
@@ -362,16 +363,25 @@ Row runChain(std::uint32_t nodes) {
 int main() {
   printHeader();
   // N changes, K=1, S=2. Target is the middle child.
-  printRow(runWide("wide", 10000, 0, 5000));
-  printRow(runWide("wide", 100000, 0, 50000));
-  printRow(runWide("wide", 1000000, 0, 500000));
-  // N fixed near 1e5, K and S grow together. Target is the last split parent.
-  printRow(runWide("split", 100000, 10, 1u + 9u * (100000u / 10u)));
-  printRow(runWide("split", 100000, 100, 1u + 99u * (100000u / 100u)));
-  printRow(runWide("split", 100000, 1000, 1u + 999u * (100000u / 1000u)));
-  printRow(runWide("split", 100000, 4000, 1u + 3999u * (100000u / 4000u)));
-  // S tracks N. Depth and the sparse index are both large.
-  printRow(runChain(20000));
+  const std::uint32_t wideFanout[] = {10000, 50000, 100000, 250000, 500000, 1000000, 2000000, 4000000};
+  for (std::uint32_t fanout : wideFanout) {
+    printRow(runWide("wide", fanout, 0, fanout / 2));
+  }
+  // N stays near 1e5. Expanded children share one parent, so S = 2K and the
+  // sparse index is a single vector. Target is the last of those children.
+  constexpr std::uint32_t splitFanout = 100000;
+  const std::uint32_t splits[] = {10, 40, 100, 250, 500, 1000, 2000, 4000, 8000, 16000};
+  for (std::uint32_t count : splits) {
+    const std::uint32_t step = splitFanout / count;
+    const widetree::NodeId target = 1u + (count - 1u) * step;
+    printRow(runWide("split", splitFanout, count, target));
+  }
+  // Each expanded node is its own map entry. Collapse still copies the map
+  // after the projection has shrunk to a handful of segments.
+  const std::uint32_t chains[] = {250, 1000, 2500, 5000, 10000, 20000, 40000};
+  for (std::uint32_t nodes : chains) {
+    printRow(runChain(nodes));
+  }
   std::printf("# sink %llu\n", static_cast<unsigned long long>(g_sink));
   return 0;
 }
