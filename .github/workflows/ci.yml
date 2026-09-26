@@ -14,6 +14,8 @@ jobs:
         run: make test
       - name: AddressSanitizer and UndefinedBehaviorSanitizer
         run: make asan
+      - name: Build microbenchmark
+        run: make build/widetree_bench
 
   windows:
     runs-on: windows-latest
@@ -29,3 +31,9 @@ jobs:
       - name: Run acceptance tests
         shell: cmd
         run: widetree_tests.exe
+      - name: Build microbenchmark
+        shell: cmd
+        run: >
+          cl /nologo /std:c++20 /EHsc /W4 /WX /Iinclude
+          src\builder.cpp src\view.cpp bench\bench_main.cpp
+          /Fe:widetree_bench.exe

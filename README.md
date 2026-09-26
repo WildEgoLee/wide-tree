@@ -20,6 +20,8 @@ make asan
 
 要求 C++20。`make test` 会跑验收：一百万个孩子、首屏、第 800000 行附近、展开带后代的节点、折叠父节点再展开并恢复、重复操作后段数稳定、旧 `RowRef` 被拒绝。
 
+`make bench` 只打印微基准，不作为正确性门禁。它把 N、可达展开记录 K、段数 S 分开看，用来决定以后要不要动 `std::map` 或段数组。一次实测见 [docs/bench-baseline.md](docs/bench-baseline.md)。
+
 ## 最小调用
 
 ```cpp
