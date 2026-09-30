@@ -36,7 +36,7 @@
 
 因此一个节点可以 `isExpanded == true` 且 `isVisible == false`：它的祖先折叠着，偏好还在。
 
-稀疏索引是按 parent 有序的 span 表，加一段被这些 span 切分的 ordinal 数组。候选在改到某个 parent 之前与当前索引共享同一份载荷；第一次改 span 才复制这两块连续内存。根的展开和折叠不改索引，不付这笔拷贝。
+稀疏索引是按 parent 有序的 span 表，加一段被这些 span 切分的 ordinal 数组。旁边有一张开放寻址表，把 parent 映到 span，恢复时每个访问到的父节点是常数查找，而不是沿 span 表二分。这张表跟 span 一起重建，不单独成为权威。候选在改到某个 parent 之前与当前索引共享同一份载荷；第一次改 span 才复制这两块连续内存和这张表。根的展开和折叠不改索引，不付这笔拷贝。
 
 曾经每个 parent 一个 `std::map` 节点。整份拷贝在大约两千个 parent 时越过 100 µs，大约一万到两万个 parent 时越过 1 ms，而段数组当时还远没到这个门槛。见 [bench-baseline.md](bench-baseline.md)。
 
@@ -110,10 +110,10 @@ struct ProjectionChange {
 - `NodeTopology` 16 字节，`NodeInfo` 16 字节，每条边一个 `uint32` 孩子 id。
 - 一百万节点、约一百万条边，快照常驻大约 34 MB，不含字符串池、容器容量和视图。
 - 每个视图另有位图（约 N/8 字节）、稀疏索引、段数组和前缀和。
-- 索引常驻是 span 表加 ordinal 数组。四万个 parent、每个一个 ordinal 时大约 640 KB，不是每个 parent 一次堆分配。
+- 索引常驻是 span 表、ordinal 数组和那张查找表。四万个 parent、每个一个 ordinal 时大约 1.6 MB，不是每个 parent 一次堆分配。
 - 修改时候选投影与旧投影短暂并存。索引载荷未改时不在此列。段数组的 O(S) 成本仍然接受。
 
-`TreeView::memory()` 分开报告快照、位图、索引、段数组。索引载荷是 ordinal 数组；另一项是 span 表的容量，加上 ordinal 数组还没用上的容量。
+`TreeView::memory()` 分开报告快照、位图、索引、段数组。索引载荷是 ordinal 数组；另一项是 span 表、查找表，加上还没用上的容量。
 
 ## 验收
 

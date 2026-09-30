@@ -96,6 +96,11 @@ class TreeView {
   struct IndexData {
     std::vector<ParentSpan> parents;
     std::vector<std::uint32_t> ordinals;
+    // Open-addressed parent → index in `parents`. Empty slots are kInvalidNode.
+    // Rebuilt when the span table changes, so project does not binary-search
+    // once per visited node. Power-of-two sized, load factor at most one half.
+    std::vector<NodeId> hashKeys;
+    std::vector<std::uint32_t> hashVals;
   };
 
   struct OrdinalInsert {
@@ -139,6 +144,7 @@ class TreeView {
   static const IndexData& readIndex(const ExpandIndex& index);
   static IndexData& writeIndex(ExpandIndex& index);
   static void shiftBegins(std::vector<ParentSpan>& parents, std::uint32_t from, int delta);
+  static void rehash(IndexData& data);
   static void insertOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal);
   static void eraseOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal);
   static ExpandIndex mergeInserts(const ExpandIndex& index,

@@ -27,6 +27,33 @@ void TreeView::shiftBegins(std::vector<ParentSpan>& parents, std::uint32_t from,
   }
 }
 
+void TreeView::rehash(IndexData& data) {
+  const std::size_t n = data.parents.size();
+  if (n == 0) {
+    data.hashKeys.clear();
+    data.hashVals.clear();
+    return;
+  }
+  std::size_t cap = 1;
+  const std::size_t need = n * 2;
+  while (cap < need) {
+    cap <<= 1;
+  }
+  data.hashKeys.assign(cap, kInvalidNode);
+  data.hashVals.assign(cap, 0);
+  const std::size_t mask = cap - 1;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    std::size_t slot =
+        static_cast<std::size_t>(static_cast<std::uint64_t>(data.parents[i].parent) * 0x9E3779B1ull) &
+        mask;
+    while (data.hashKeys[slot] != kInvalidNode) {
+      slot = (slot + 1) & mask;
+    }
+    data.hashKeys[slot] = data.parents[i].parent;
+    data.hashVals[slot] = i;
+  }
+}
+
 TreeView::IndexData& TreeView::writeIndex(ExpandIndex& index) {
   // use_count is exact on this thread. A candidate that has not edited a
   // parent still shares the live payload; the first edit unshares it.
@@ -357,10 +384,12 @@ MemoryReport TreeView::memory() const {
   report.indexedParentCount = static_cast<std::uint32_t>(stored.parents.size());
   report.expandedCount = bits_.count();
   report.indexPayloadBytes = stored.ordinals.size() * sizeof(std::uint32_t);
-  // Span table plus unused ordinal capacity. Not a per-parent heap node.
+  // Span table, spare ordinal capacity, and the open-addressed parent lookup.
   report.indexNodeEstimateBytes =
       stored.parents.capacity() * sizeof(ParentSpan) +
-      (stored.ordinals.capacity() - stored.ordinals.size()) * sizeof(std::uint32_t);
+      (stored.ordinals.capacity() - stored.ordinals.size()) * sizeof(std::uint32_t) +
+      stored.hashKeys.capacity() * sizeof(NodeId) +
+      stored.hashVals.capacity() * sizeof(std::uint32_t);
   return report;
 }
 
@@ -461,6 +490,23 @@ const char* TreeView::checkInvariants() const {
   }
   if (cursor != index.ordinals.size()) {
     return "index span end";
+  }
+  if (index.parents.empty()) {
+    if (!index.hashKeys.empty() || !index.hashVals.empty()) {
+      return "index hash";
+    }
+  } else {
+    if (index.hashKeys.size() != index.hashVals.size() || index.hashKeys.empty() ||
+        (index.hashKeys.size() & (index.hashKeys.size() - 1)) != 0 ||
+        index.hashKeys.size() < index.parents.size() * 2) {
+      return "index hash";
+    }
+    for (std::uint32_t i = 0; i < index.parents.size(); ++i) {
+      const ParentSpan* found = findSpan(index_, index.parents[i].parent);
+      if (found != &index.parents[i]) {
+        return "index hash";
+      }
+    }
   }
 
   for (std::uint32_t id = 0; id < snap_->nodeCount(); ++id) {
@@ -628,13 +674,22 @@ void TreeView::buildPrefix(const std::vector<Segment>& segments,
 
 const TreeView::ParentSpan* TreeView::findSpan(const ExpandIndex& index, NodeId parent) {
   const IndexData& data = readIndex(index);
-  const auto it = std::lower_bound(
-      data.parents.begin(), data.parents.end(), parent,
-      [](const ParentSpan& span, NodeId id) { return span.parent < id; });
-  if (it == data.parents.end() || it->parent != parent) {
+  if (data.parents.empty() || data.hashKeys.empty()) {
     return nullptr;
   }
-  return &*it;
+  const std::size_t mask = data.hashKeys.size() - 1;
+  std::size_t slot =
+      static_cast<std::size_t>(static_cast<std::uint64_t>(parent) * 0x9E3779B1ull) & mask;
+  while (true) {
+    const NodeId key = data.hashKeys[slot];
+    if (key == kInvalidNode) {
+      return nullptr;
+    }
+    if (key == parent) {
+      return &data.parents[data.hashVals[slot]];
+    }
+    slot = (slot + 1) & mask;
+  }
 }
 
 const std::uint32_t* TreeView::ordinalsOf(const ExpandIndex& index, NodeId parent,
@@ -662,6 +717,7 @@ void TreeView::insertOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t or
     ordinals.insert(ordinals.begin() + begin, ordinal);
     parents.insert(parents.begin() + pos, ParentSpan{parent, begin, 1});
     shiftBegins(parents, pos + 1, 1);
+    rehash(data);
     return;
   }
   const std::uint32_t pos = static_cast<std::uint32_t>(it - parents.begin());
@@ -675,6 +731,7 @@ void TreeView::insertOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t or
   ordinals.insert(ordinals.begin() + at, ordinal);
   parents[pos].count += 1;
   shiftBegins(parents, pos + 1, 1);
+  rehash(data);
 }
 
 void TreeView::eraseOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal) {
@@ -699,10 +756,12 @@ void TreeView::eraseOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ord
   if (parents[pos].count == 1) {
     parents.erase(parents.begin() + pos);
     shiftBegins(parents, pos, -1);
+    rehash(data);
     return;
   }
   parents[pos].count -= 1;
   shiftBegins(parents, pos + 1, -1);
+  rehash(data);
 }
 
 TreeView::ExpandIndex TreeView::mergeInserts(const ExpandIndex& index,
@@ -777,6 +836,7 @@ TreeView::ExpandIndex TreeView::mergeInserts(const ExpandIndex& index,
       dst.parents.push_back(ParentSpan{parent, begin, count});
     }
   }
+  rehash(dst);
   return out;
 }
 
