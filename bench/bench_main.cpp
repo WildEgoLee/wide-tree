@@ -376,8 +376,8 @@ int main() {
     const widetree::NodeId target = 1u + (count - 1u) * step;
     printRow(runWide("split", splitFanout, count, target));
   }
-  // Each expanded node is its own map entry. Collapse still copies the map
-  // after the projection has shrunk to a handful of segments.
+  // Each expanded node is its own parent span. Collapse of the root does not
+  // edit the index, but the candidate still copies it. The copy is two arrays.
   const std::uint32_t chains[] = {250, 1000, 2500, 5000, 10000, 20000, 40000};
   for (std::uint32_t nodes : chains) {
     printRow(runChain(nodes));

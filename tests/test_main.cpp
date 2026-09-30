@@ -709,6 +709,108 @@ void testMillionChildAcceptance() {
   CHECK(!hidden.isExpanded(kRoot));
 }
 
+// Parent ids are not insertion order: the root id sits between its children,
+// and expanded ordinals land at the front, middle, and back of a span.
+// Collapsing then deletes a span that is not the last one.
+void testPackedIndexMiddleEdits() {
+  // 5
+  //  ├─ 1
+  //  │   └─ 2
+  //  │       └─ 0
+  //  ├─ 8
+  //  │   └─ 4
+  //  │       └─ 9
+  //  └─ 3
+  //      └─ 6
+  //          └─ 7
+  constexpr NodeId kRoot = 5;
+  TreeBuilder builder(10);
+  builder.setRoot(kRoot);
+  builder.addEdge(kRoot, 1);
+  builder.addEdge(kRoot, 8);
+  builder.addEdge(kRoot, 3);
+  builder.addEdge(1, 2);
+  builder.addEdge(2, 0);
+  builder.addEdge(8, 4);
+  builder.addEdge(4, 9);
+  builder.addEdge(3, 6);
+  builder.addEdge(6, 7);
+  const auto snap = mustBuild(builder, __LINE__);
+  if (!snap) {
+    return;
+  }
+
+  for (int hide = 0; hide < 2; ++hide) {
+    TreeView view;
+    view.reset(snap, ViewConfig{hide == 1});
+    const NodeId order[] = {8, 4, 1, 2, 3, 6};
+    for (NodeId id : order) {
+      if (!view.isVisible(id)) {
+        checkStatus(__LINE__, view.reveal(id).status, Status::Ok);
+      }
+      const auto row = view.rowOf(id);
+      CHECK(row.has_value());
+      if (!row) {
+        return;
+      }
+      checkStatus(__LINE__, view.expandAt(*view.rowRef(*row)).status, Status::Ok);
+      checkOk(view, __LINE__);
+    }
+    expectRows(view, *snap, __LINE__);
+    CHECK(view.memory().indexedParentCount >= 4u);
+
+    // Drop the first parent span (node 2 is the only expanded child of 1).
+    checkStatus(__LINE__, view.collapseAt(*view.rowRef(*view.rowOf(2))).status, Status::Ok);
+    CHECK(view.isExpanded(0) == false);
+    CHECK(!view.isVisible(0));
+    CHECK(view.isExpanded(1));
+    checkOk(view, __LINE__);
+    expectRows(view, *snap, __LINE__);
+
+    // Middle ordinal under the root: 8 sits between 1 and 3. Its descendant
+    // preference (4) stays, so 4's span outlives 8's visibility.
+    const auto parentsBefore = view.memory().indexedParentCount;
+    checkStatus(__LINE__, view.collapseAt(*view.rowRef(*view.rowOf(8))).status, Status::Ok);
+    CHECK(!view.isExpanded(8));
+    CHECK(view.isExpanded(4));
+    CHECK(!view.isVisible(4));
+    CHECK(!view.isVisible(9));
+    checkOk(view, __LINE__);
+    expectRows(view, *snap, __LINE__);
+
+    checkStatus(__LINE__, view.expandAt(*view.rowRef(*view.rowOf(8))).status, Status::Ok);
+    CHECK(view.isExpanded(4));
+    CHECK(view.isVisible(9));
+    CHECK_EQ(view.memory().indexedParentCount, parentsBefore);
+    checkOk(view, __LINE__);
+    expectRows(view, *snap, __LINE__);
+
+    // Collapse the root side and reveal the deep leaf. Ancestors open, 9 does not.
+    if (hide == 0) {
+      checkStatus(__LINE__, view.collapseAt(*view.rowRef(0)).status, Status::Ok);
+    } else {
+      // Hide-root has no root row. Fold the depth-0 parents only; doing it
+      // from a snapshot of ids avoids collapsing a child the parent just hid.
+      const NodeId top[] = {1, 8, 3};
+      for (NodeId id : top) {
+        if (!view.isVisible(id) || !view.isExpanded(id)) {
+          continue;
+        }
+        checkStatus(__LINE__, view.collapseAt(*view.rowRef(*view.rowOf(id))).status, Status::Ok);
+      }
+    }
+    CHECK(!view.isVisible(9));
+    CHECK(view.isExpanded(4));
+    checkStatus(__LINE__, view.reveal(9).status, Status::Ok);
+    CHECK(view.isVisible(9));
+    CHECK(!view.isExpanded(9));
+    CHECK(view.isExpanded(4));
+    CHECK(view.isExpanded(8));
+    checkOk(view, __LINE__);
+    expectRows(view, *snap, __LINE__);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -717,6 +819,7 @@ int main() {
   testHideRootDoesNotForceRootOpen();
   testRandomAgainstOracle();
   testDeepChainUsesHeapStack();
+  testPackedIndexMiddleEdits();
   testMillionChildAcceptance();
   if (g_failed != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failed);

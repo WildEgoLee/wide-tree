@@ -6,8 +6,6 @@
 namespace widetree {
 namespace {
 
-constexpr std::uint64_t kMapNodeEstimate = 64;
-
 ViewResult errorResult(Status status, std::uint64_t revision, RowCount rows) {
   ViewResult result;
   result.status = status;
@@ -20,6 +18,28 @@ ViewResult errorResult(Status status, std::uint64_t revision, RowCount rows) {
 }
 
 }  // namespace
+
+// `delta` is +1 or -1. Later spans sit strictly after the edited ordinal, so
+// subtracting one never underflows a real begin.
+void TreeView::shiftBegins(std::vector<ParentSpan>& parents, std::uint32_t from, int delta) {
+  for (std::uint32_t i = from; i < parents.size(); ++i) {
+    parents[i].begin = static_cast<std::uint32_t>(parents[i].begin + delta);
+  }
+}
+
+TreeView::IndexData& TreeView::writeIndex(ExpandIndex& index) {
+  // use_count is exact on this thread. A candidate that has not edited a
+  // parent still shares the live payload; the first edit unshares it.
+  if (!index.data || index.data.use_count() != 1) {
+    index.data = std::make_shared<IndexData>(index.data ? *index.data : IndexData{});
+  }
+  return *index.data;
+}
+
+const TreeView::IndexData& TreeView::readIndex(const ExpandIndex& index) {
+  static const IndexData kEmpty;
+  return index.data ? *index.data : kEmpty;
+}
 
 void TreeView::ExpandBitmap::reset(std::uint32_t nodeCount) {
   words_.assign((static_cast<std::size_t>(nodeCount) + 63u) / 64u, 0);
@@ -297,14 +317,16 @@ ViewResult TreeView::reveal(NodeId id) {
   const std::uint64_t oldRevision = revision_;
   const RowCount oldCount = rowCount_;
   ExpandBitmap bits = bits_;
-  ExpandIndex index = index_;
+  std::vector<OrdinalInsert> inserts;
+  inserts.reserve(toExpand.size());
   for (NodeId node : toExpand) {
     bits.set(node);
     const NodeId parent = snap_->topology(node).parent;
     if (parent != kInvalidNode) {
-      insertOrdinal(index, parent, snap_->topology(node).rowInParent);
+      inserts.push_back(OrdinalInsert{parent, snap_->topology(node).rowInParent});
     }
   }
+  ExpandIndex index = mergeInserts(index_, inserts);
   Candidate candidate = candidateFrom(std::move(bits), std::move(index));
   const RowCount inserted = candidate.rowCount - oldCount;
   commit(candidate);
@@ -331,14 +353,14 @@ MemoryReport TreeView::memory() const {
   report.segmentCount = static_cast<std::uint32_t>(segments_.size());
   report.segmentBytes = segments_.size() * sizeof(Segment);
   report.prefixBytes = prefix_.size() * sizeof(RowIndex);
-  report.indexedParentCount = static_cast<std::uint32_t>(index_.ordinals.size());
+  const IndexData& stored = readIndex(index_);
+  report.indexedParentCount = static_cast<std::uint32_t>(stored.parents.size());
   report.expandedCount = bits_.count();
-  for (const auto& entry : index_.ordinals) {
-    report.indexPayloadBytes += entry.second.size() * sizeof(std::uint32_t);
-    report.indexNodeEstimateBytes += kMapNodeEstimate;
-    report.indexNodeEstimateBytes +=
-        entry.second.capacity() * sizeof(std::uint32_t) + sizeof(entry.second);
-  }
+  report.indexPayloadBytes = stored.ordinals.size() * sizeof(std::uint32_t);
+  // Span table plus unused ordinal capacity. Not a per-parent heap node.
+  report.indexNodeEstimateBytes =
+      stored.parents.capacity() * sizeof(ParentSpan) +
+      (stored.ordinals.capacity() - stored.ordinals.size()) * sizeof(std::uint32_t);
   return report;
 }
 
@@ -398,27 +420,47 @@ const char* TreeView::checkInvariants() const {
     return "row count";
   }
 
-  for (const auto& entry : index_.ordinals) {
-    const NodeId parent = entry.first;
-    if (!snap_->contains(parent)) {
-      return "index parent";
-    }
-    const auto& ordinals = entry.second;
-    if (ordinals.empty()) {
+  const IndexData& index = readIndex(index_);
+  std::uint32_t cursor = 0;
+  NodeId previousParent = 0;
+  bool seenParent = false;
+  for (const ParentSpan& span : index.parents) {
+    if (span.count == 0) {
       return "empty index entry";
     }
-    for (std::size_t i = 0; i < ordinals.size(); ++i) {
-      if (i > 0 && ordinals[i] <= ordinals[i - 1]) {
+    if (!snap_->contains(span.parent)) {
+      return "index parent";
+    }
+    if (seenParent && span.parent <= previousParent) {
+      return "index parent order";
+    }
+    if (span.begin != cursor) {
+      return "index span gap";
+    }
+    const std::uint64_t end =
+        static_cast<std::uint64_t>(span.begin) + static_cast<std::uint64_t>(span.count);
+    if (end > index.ordinals.size()) {
+      return "index span range";
+    }
+    for (std::uint32_t i = 0; i < span.count; ++i) {
+      const std::uint32_t ordinal = index.ordinals[span.begin + i];
+      if (i > 0 && ordinal <= index.ordinals[span.begin + i - 1]) {
         return "index order";
       }
-      if (ordinals[i] >= snap_->topology(parent).childCount) {
+      if (ordinal >= snap_->topology(span.parent).childCount) {
         return "index ordinal";
       }
-      const NodeId child = snap_->child(parent, ordinals[i]);
+      const NodeId child = snap_->child(span.parent, ordinal);
       if (!bits_.test(child)) {
         return "index child is not expanded";
       }
     }
+    cursor = static_cast<std::uint32_t>(end);
+    previousParent = span.parent;
+    seenParent = true;
+  }
+  if (cursor != index.ordinals.size()) {
+    return "index span end";
   }
 
   for (std::uint32_t id = 0; id < snap_->nodeCount(); ++id) {
@@ -429,13 +471,14 @@ const char* TreeView::checkInvariants() const {
     if (parent == kInvalidNode) {
       continue;
     }
-    const auto it = index_.ordinals.find(parent);
-    if (it == index_.ordinals.end()) {
+    const ParentSpan* span = findSpan(index_, parent);
+    if (span == nullptr) {
       return "expanded node missing from index";
     }
-    const auto& ordinals = it->second;
+    const auto begin = index.ordinals.begin() + span->begin;
+    const auto end = begin + span->count;
     const std::uint32_t ordinal = snap_->topology(id).rowInParent;
-    if (!std::binary_search(ordinals.begin(), ordinals.end(), ordinal)) {
+    if (!std::binary_search(begin, end, ordinal)) {
       return "expanded ordinal missing from index";
     }
   }
@@ -525,11 +568,9 @@ void TreeView::project(const ExpandBitmap& bits, const ExpandIndex& index,
     }
   } else {
     top.childCount = snap_->topology(root).childCount;
-    const auto it = index.ordinals.find(root);
-    if (it != index.ordinals.end() && !it->second.empty()) {
-      top.ords = it->second.data();
-      top.ordCount = static_cast<std::uint32_t>(it->second.size());
-    }
+    std::uint32_t count = 0;
+    top.ords = ordinalsOf(index, root, count);
+    top.ordCount = count;
   }
   stack.push_back(top);
 
@@ -566,11 +607,9 @@ void TreeView::project(const ExpandBitmap& bits, const ExpandIndex& index,
     childFrame.segmentParent = child;
     childFrame.depth = cur.depth + 1;
     childFrame.childCount = kids;
-    const auto it = index.ordinals.find(child);
-    if (it != index.ordinals.end() && !it->second.empty()) {
-      childFrame.ords = it->second.data();
-      childFrame.ordCount = static_cast<std::uint32_t>(it->second.size());
-    }
+    std::uint32_t count = 0;
+    childFrame.ords = ordinalsOf(index, child, count);
+    childFrame.ordCount = count;
     stack.push_back(childFrame);
   }
 }
@@ -587,27 +626,158 @@ void TreeView::buildPrefix(const std::vector<Segment>& segments,
   rowCount = prefix.back();
 }
 
-void TreeView::insertOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal) {
-  std::vector<std::uint32_t>& ordinals = index.ordinals[parent];
-  const auto it = std::lower_bound(ordinals.begin(), ordinals.end(), ordinal);
-  if (it == ordinals.end() || *it != ordinal) {
-    ordinals.insert(it, ordinal);
+const TreeView::ParentSpan* TreeView::findSpan(const ExpandIndex& index, NodeId parent) {
+  const IndexData& data = readIndex(index);
+  const auto it = std::lower_bound(
+      data.parents.begin(), data.parents.end(), parent,
+      [](const ParentSpan& span, NodeId id) { return span.parent < id; });
+  if (it == data.parents.end() || it->parent != parent) {
+    return nullptr;
   }
+  return &*it;
+}
+
+const std::uint32_t* TreeView::ordinalsOf(const ExpandIndex& index, NodeId parent,
+                                          std::uint32_t& count) {
+  const ParentSpan* span = findSpan(index, parent);
+  if (span == nullptr || span->count == 0) {
+    count = 0;
+    return nullptr;
+  }
+  count = span->count;
+  return readIndex(index).ordinals.data() + span->begin;
+}
+
+void TreeView::insertOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal) {
+  IndexData& data = writeIndex(index);
+  auto& parents = data.parents;
+  auto& ordinals = data.ordinals;
+  const auto it = std::lower_bound(
+      parents.begin(), parents.end(), parent,
+      [](const ParentSpan& span, NodeId id) { return span.parent < id; });
+  if (it == parents.end() || it->parent != parent) {
+    const std::uint32_t begin =
+        it == parents.end() ? static_cast<std::uint32_t>(ordinals.size()) : it->begin;
+    const std::uint32_t pos = static_cast<std::uint32_t>(it - parents.begin());
+    ordinals.insert(ordinals.begin() + begin, ordinal);
+    parents.insert(parents.begin() + pos, ParentSpan{parent, begin, 1});
+    shiftBegins(parents, pos + 1, 1);
+    return;
+  }
+  const std::uint32_t pos = static_cast<std::uint32_t>(it - parents.begin());
+  const auto rangeBegin = ordinals.begin() + parents[pos].begin;
+  const auto rangeEnd = rangeBegin + parents[pos].count;
+  const auto found = std::lower_bound(rangeBegin, rangeEnd, ordinal);
+  if (found != rangeEnd && *found == ordinal) {
+    return;
+  }
+  const std::uint32_t at = static_cast<std::uint32_t>(found - ordinals.begin());
+  ordinals.insert(ordinals.begin() + at, ordinal);
+  parents[pos].count += 1;
+  shiftBegins(parents, pos + 1, 1);
 }
 
 void TreeView::eraseOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal) {
-  const auto found = index.ordinals.find(parent);
-  if (found == index.ordinals.end()) {
+  IndexData& data = writeIndex(index);
+  auto& parents = data.parents;
+  auto& ordinals = data.ordinals;
+  const auto it = std::lower_bound(
+      parents.begin(), parents.end(), parent,
+      [](const ParentSpan& span, NodeId id) { return span.parent < id; });
+  if (it == parents.end() || it->parent != parent) {
     return;
   }
-  std::vector<std::uint32_t>& ordinals = found->second;
-  const auto it = std::lower_bound(ordinals.begin(), ordinals.end(), ordinal);
-  if (it != ordinals.end() && *it == ordinal) {
-    ordinals.erase(it);
+  const std::uint32_t pos = static_cast<std::uint32_t>(it - parents.begin());
+  const auto rangeBegin = ordinals.begin() + parents[pos].begin;
+  const auto rangeEnd = rangeBegin + parents[pos].count;
+  const auto found = std::lower_bound(rangeBegin, rangeEnd, ordinal);
+  if (found == rangeEnd || *found != ordinal) {
+    return;
   }
-  if (ordinals.empty()) {
-    index.ordinals.erase(found);
+  const std::uint32_t at = static_cast<std::uint32_t>(found - ordinals.begin());
+  ordinals.erase(ordinals.begin() + at);
+  if (parents[pos].count == 1) {
+    parents.erase(parents.begin() + pos);
+    shiftBegins(parents, pos, -1);
+    return;
   }
+  parents[pos].count -= 1;
+  shiftBegins(parents, pos + 1, -1);
+}
+
+TreeView::ExpandIndex TreeView::mergeInserts(const ExpandIndex& index,
+                                             std::span<const OrdinalInsert> inserts) {
+  if (inserts.empty()) {
+    return index;
+  }
+  const IndexData& src = readIndex(index);
+  std::vector<OrdinalInsert> sorted(inserts.begin(), inserts.end());
+  std::sort(sorted.begin(), sorted.end(), [](const OrdinalInsert& a, const OrdinalInsert& b) {
+    if (a.parent != b.parent) {
+      return a.parent < b.parent;
+    }
+    return a.ordinal < b.ordinal;
+  });
+  sorted.erase(std::unique(sorted.begin(), sorted.end(),
+                           [](const OrdinalInsert& a, const OrdinalInsert& b) {
+                             return a.parent == b.parent && a.ordinal == b.ordinal;
+                           }),
+               sorted.end());
+
+  ExpandIndex out;
+  IndexData& dst = writeIndex(out);
+  dst.parents.reserve(src.parents.size() + sorted.size());
+  dst.ordinals.reserve(src.ordinals.size() + sorted.size());
+  std::size_t spanIndex = 0;
+  std::size_t insertIndex = 0;
+  while (spanIndex < src.parents.size() || insertIndex < sorted.size()) {
+    const bool haveOld = spanIndex < src.parents.size();
+    const bool haveNew = insertIndex < sorted.size();
+    NodeId parent = kInvalidNode;
+    if (haveOld && haveNew) {
+      parent = std::min(src.parents[spanIndex].parent, sorted[insertIndex].parent);
+    } else if (haveOld) {
+      parent = src.parents[spanIndex].parent;
+    } else {
+      parent = sorted[insertIndex].parent;
+    }
+
+    const std::uint32_t* oldOrds = nullptr;
+    std::uint32_t oldCount = 0;
+    std::uint32_t oldAt = 0;
+    if (haveOld && src.parents[spanIndex].parent == parent) {
+      oldOrds = src.ordinals.data() + src.parents[spanIndex].begin;
+      oldCount = src.parents[spanIndex].count;
+      ++spanIndex;
+    }
+
+    const std::uint32_t begin = static_cast<std::uint32_t>(dst.ordinals.size());
+    while (oldAt < oldCount ||
+           (insertIndex < sorted.size() && sorted[insertIndex].parent == parent)) {
+      const bool takeOld =
+          oldAt < oldCount &&
+          (insertIndex >= sorted.size() || sorted[insertIndex].parent != parent ||
+           oldOrds[oldAt] <= sorted[insertIndex].ordinal);
+      std::uint32_t value = 0;
+      if (takeOld) {
+        value = oldOrds[oldAt++];
+        if (insertIndex < sorted.size() && sorted[insertIndex].parent == parent &&
+            sorted[insertIndex].ordinal == value) {
+          ++insertIndex;
+        }
+      } else {
+        value = sorted[insertIndex++].ordinal;
+      }
+      if (dst.ordinals.size() == begin || dst.ordinals.back() != value) {
+        dst.ordinals.push_back(value);
+      }
+    }
+    const std::uint32_t count = static_cast<std::uint32_t>(dst.ordinals.size() - begin);
+    if (count > 0) {
+      dst.parents.push_back(ParentSpan{parent, begin, count});
+    }
+  }
+  return out;
 }
 
 TreeView::Candidate TreeView::candidateFrom(ExpandBitmap bits, ExpandIndex index) const {

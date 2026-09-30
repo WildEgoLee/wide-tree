@@ -1,8 +1,6 @@
-#pragma once
-
 #include "widetree/snapshot.hpp"
 
-#include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -83,10 +81,31 @@ class TreeView {
     std::uint32_t count_ = 0;
   };
 
-  // Parent node -> child ordinals that currently prefer expanded, in order.
-  // Only parents with at least one such child have an entry.
+  // Packed sparse index. `parents` is sorted by parent id. Each span names a
+  // half-open run of `ordinals`, which is that parent's expanded child
+  // ordinals in increasing order. The payload is shared: a candidate copy is
+  // a pointer bump until a parent span actually changes, and the changed
+  // payload is these two buffers, not a heap node per parent.
+  struct ParentSpan {
+    NodeId parent = kInvalidNode;
+    std::uint32_t begin = 0;
+    std::uint32_t count = 0;
+  };
+  static_assert(sizeof(ParentSpan) <= 16, "ParentSpan stays a small record");
+
+  struct IndexData {
+    std::vector<ParentSpan> parents;
+    std::vector<std::uint32_t> ordinals;
+  };
+
+  struct OrdinalInsert {
+    NodeId parent = kInvalidNode;
+    std::uint32_t ordinal = 0;
+  };
+
   struct ExpandIndex {
-    std::map<NodeId, std::vector<std::uint32_t>> ordinals;
+    // Null means empty. A candidate shares this pointer until an edit unshares it.
+    std::shared_ptr<IndexData> data;
   };
 
   struct Frame {
@@ -114,8 +133,16 @@ class TreeView {
                std::vector<Segment>& out) const;
   static void buildPrefix(const std::vector<Segment>& segments,
                           std::vector<RowIndex>& prefix, RowCount& rowCount);
+  static const ParentSpan* findSpan(const ExpandIndex& index, NodeId parent);
+  static const std::uint32_t* ordinalsOf(const ExpandIndex& index, NodeId parent,
+                                         std::uint32_t& count);
+  static const IndexData& readIndex(const ExpandIndex& index);
+  static IndexData& writeIndex(ExpandIndex& index);
+  static void shiftBegins(std::vector<ParentSpan>& parents, std::uint32_t from, int delta);
   static void insertOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal);
   static void eraseOrdinal(ExpandIndex& index, NodeId parent, std::uint32_t ordinal);
+  static ExpandIndex mergeInserts(const ExpandIndex& index,
+                                  std::span<const OrdinalInsert> inserts);
   Candidate candidateFrom(ExpandBitmap bits, ExpandIndex index) const;
   void commit(Candidate& candidate);
   ViewResult finishSplice(std::uint64_t oldRevision, RowCount oldCount, RowIndex first,
