@@ -375,8 +375,8 @@ void printHeader() {
   std::printf("# median of 5 trials. expand_us and collapse_us are the mutation only; rowRef is not included.\n");
   std::printf("# K is memory.expandedCount. In these shapes every expanded node is reachable.\n");
   std::printf("# S is memory.segmentCount. There is no rowAt(); rowRef is the row->node locate.\n");
-  std::printf("# edit-root toggles the root. edit-head/mid/tail toggle one expanded child;\n");
-  std::printf("# that child drops exactly two segments. All four still rebuild the whole projection.\n");
+  std::printf("# edit-root toggles the root. edit-head/mid/tail splice one expanded child;\n");
+  std::printf("# that child drops exactly two segments. The root expand still rewrites its subtree.\n");
   std::puts(
       "shape\tN\tfanout\tK\tS\tindexParents\tbitmapB\tindexEstB\tsegmentB\tbuild_us\t"
       "rows64_us\trowRef_us\trowOf_us\tquery_iters\texpand_us\tcollapse_us\ttoggle_iters");
@@ -486,6 +486,191 @@ void runEdit(std::uint32_t fanout, std::uint32_t splits) {
   }
 }
 
+// A split projection plus one hidden chain under the head, middle, and tail
+// leaves. Revealing the node at `depth` opens exactly that many ancestors.
+// Collapsing them from the inside out clears the preference bits again.
+struct RevealCase {
+  std::shared_ptr<const widetree::TreeSnapshot> snapshot;
+  widetree::TreeView view;
+  std::uint32_t fanout = 0;
+  std::uint32_t splits = 0;
+  std::uint32_t chain = 0;
+  std::uint32_t sBefore = 0;
+};
+
+RevealCase makeRevealHost(std::uint32_t fanout, std::uint32_t splits, std::uint32_t chain) {
+  if (fanout / splits < 1 || chain < 1) {
+    fail("reveal shape");
+  }
+  const std::uint32_t base = fanout + 1u + splits;
+  const std::uint32_t nodes = base + 3u * chain;
+  widetree::TreeBuilder builder(nodes);
+  builder.setRoot(0);
+  builder.addChildRange(0, 1, fanout);
+  const std::uint32_t step = fanout / splits;
+  const std::uint32_t posIndex[3] = {0u, splits / 2u, splits - 1u};
+  for (std::uint32_t i = 0; i < splits; ++i) {
+    builder.addEdge(1u + i * step, fanout + 1u + i);
+  }
+  for (int pos = 0; pos < 3; ++pos) {
+    widetree::NodeId parent = fanout + 1u + posIndex[pos];
+    for (std::uint32_t d = 0; d < chain; ++d) {
+      const widetree::NodeId child = base + static_cast<std::uint32_t>(pos) * chain + d;
+      builder.addEdge(parent, child);
+      parent = child;
+    }
+  }
+  RevealCase host;
+  host.snapshot = mustBuild(builder);
+  host.fanout = fanout;
+  host.splits = splits;
+  host.chain = chain;
+  if (host.view.reset(host.snapshot).status != widetree::Status::Ok) {
+    fail("reveal reset");
+  }
+  if (host.view.expandAt(*host.view.rowRef(0)).status != widetree::Status::Ok) {
+    fail("reveal expand root");
+  }
+  for (std::uint32_t i = 0; i < splits; ++i) {
+    const widetree::NodeId parent = 1u + i * step;
+    const auto row = host.view.rowOf(parent);
+    if (!row || host.view.expandAt(*host.view.rowRef(*row)).status != widetree::Status::Ok) {
+      fail("reveal expand split");
+    }
+  }
+  host.sBefore = host.view.memory().segmentCount;
+  const std::uint32_t expect = 2u * (splits + 1u);
+  if (host.sBefore != expect) {
+    std::fprintf(stderr, "reveal S %u expected %u\n", host.sBefore, expect);
+    fail("reveal base shape");
+  }
+  return host;
+}
+
+widetree::NodeId revealLeaf(const RevealCase& host, int pos) {
+  const std::uint32_t posIndex[3] = {0u, host.splits / 2u, host.splits - 1u};
+  return host.fanout + 1u + posIndex[pos];
+}
+
+widetree::NodeId revealTarget(const RevealCase& host, int pos, std::uint32_t depth) {
+  const std::uint32_t base = host.fanout + 1u + host.splits;
+  return base + static_cast<std::uint32_t>(pos) * host.chain + (depth - 1u);
+}
+
+void closeRevealedChain(widetree::TreeView& view, widetree::NodeId leaf, widetree::NodeId first,
+                        std::uint32_t depth) {
+  if (depth >= 2u) {
+    for (std::uint32_t i = depth - 1u; i-- > 0u;) {
+      const auto row = view.rowOf(first + i);
+      if (!row || view.collapseAt(*view.rowRef(*row)).status != widetree::Status::Ok) {
+        fail("close chain");
+      }
+    }
+  }
+  const auto row = view.rowOf(leaf);
+  if (!row || view.collapseAt(*view.rowRef(*row)).status != widetree::Status::Ok) {
+    fail("close leaf");
+  }
+}
+
+struct RevealUs {
+  double reveal = 0;
+  std::uint64_t insertedRows = 0;
+  std::uint32_t insertedSegments = 0;
+  std::uint32_t ancestors = 0;
+  std::uint32_t sBefore = 0;
+  std::uint32_t sAfter = 0;
+  int iters = 0;
+};
+
+RevealUs measureReveal(RevealCase& host, int pos, std::uint32_t depth, int trials) {
+  widetree::TreeView& view = host.view;
+  const widetree::NodeId leaf = revealLeaf(host, pos);
+  const widetree::NodeId target = revealTarget(host, pos, depth);
+  const widetree::NodeId first =
+      host.fanout + 1u + host.splits + static_cast<std::uint32_t>(pos) * host.chain;
+  if (view.isExpanded(leaf)) {
+    closeRevealedChain(view, leaf, first, depth);
+  }
+  if (view.memory().segmentCount != host.sBefore) {
+    fail("reveal host not restored before timing");
+  }
+  const std::uint32_t expandedBefore = view.memory().expandedCount;
+  const auto warmed = view.reveal(target);
+  if (warmed.status != widetree::Status::Ok) {
+    fail("reveal warmup");
+  }
+  if (view.isExpanded(target) || !view.isVisible(target)) {
+    fail("reveal target");
+  }
+  RevealUs out;
+  out.sBefore = host.sBefore;
+  out.sAfter = view.memory().segmentCount;
+  out.insertedRows = warmed.change.splice.inserted;
+  out.insertedSegments = out.sAfter - out.sBefore;
+  out.ancestors = view.memory().expandedCount - expandedBefore;
+  if (view.checkInvariants() != nullptr) {
+    fail(view.checkInvariants());
+  }
+  closeRevealedChain(view, leaf, first, depth);
+  if (view.memory().segmentCount != host.sBefore ||
+      view.memory().expandedCount != expandedBefore) {
+    fail("reveal warmup did not restore");
+  }
+
+  auto once = [&] {
+    const auto started = Clock::now();
+    const auto result = view.reveal(target);
+    const double us = usSince(started);
+    if (result.status != widetree::Status::Ok) {
+      fail("reveal");
+    }
+    g_sink += result.change.splice.inserted;
+    closeRevealedChain(view, leaf, first, depth);
+    return us;
+  };
+  const double probe = once();
+  int iters = probe <= 1.0 ? 2000 : static_cast<int>(6000.0 / probe);
+  if (iters < 6) {
+    iters = 6;
+  }
+  if (iters > 2000) {
+    iters = 2000;
+  }
+  std::vector<double> samples;
+  for (int trial = 0; trial < trials; ++trial) {
+    double sum = 0;
+    for (int i = 0; i < iters; ++i) {
+      sum += once();
+    }
+    samples.push_back(sum / static_cast<double>(iters));
+  }
+  if (view.memory().segmentCount != host.sBefore) {
+    fail("reveal timing did not restore S");
+  }
+  out.reveal = medianOf(std::move(samples));
+  out.iters = iters;
+  return out;
+}
+
+void runReveal(std::uint32_t fanout, std::uint32_t splits) {
+  constexpr std::uint32_t kChain = 512;
+  RevealCase host = makeRevealHost(fanout, splits, kChain);
+  const std::uint32_t depths[] = {1u, 8u, 64u, 512u};
+  const char* positions[] = {"head", "mid", "tail"};
+  for (std::uint32_t depth : depths) {
+    for (int pos = 0; pos < 3; ++pos) {
+      const RevealUs us = measureReveal(host, pos, depth, 5);
+      std::printf(
+          "reveal\t%s\t%u\t%u\t%u\t%u\t%u\t%llu\t%u\t%.3f\t%d\n", positions[pos], depth,
+          host.snapshot->nodeCount(), us.sBefore, us.sAfter, us.ancestors,
+          static_cast<unsigned long long>(us.insertedRows), us.insertedSegments, us.reveal,
+          us.iters);
+      std::fflush(stdout);
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -516,6 +701,16 @@ int main() {
   const std::uint32_t editSplits[] = {4000, 16000, 64000};
   for (int i = 0; i < 3; ++i) {
     runEdit(editFanout[i], editSplits[i]);
+  }
+  // Hidden chain under a visible leaf. S_before excludes the chain.
+  // Depth is how many collapsed ancestors reveal opens.
+  std::printf(
+      "# reveal\tpos\tdepth\tN\tS_before\tS_after\tancestors\tinserted_rows\t"
+      "inserted_segments\treveal_us\titers\n");
+  const std::uint32_t revealFanout[] = {100000u, 128000u};
+  const std::uint32_t revealSplits[] = {16000u, 64000u};
+  for (int i = 0; i < 2; ++i) {
+    runReveal(revealFanout[i], revealSplits[i]);
   }
   std::printf("# sink %llu\n", static_cast<unsigned long long>(g_sink));
   return 0;

@@ -370,9 +370,18 @@ ViewResult TreeView::reveal(NodeId id) {
     }
   }
   ExpandIndex index = mergeInserts(index_, inserts);
-  Candidate candidate = candidateFrom(std::move(bits), std::move(index));
-  const RowCount inserted = candidate.rowCount - oldCount;
-  commit(candidate);
+  // The anchor is the only toggled node already on screen. Inner ancestors are
+  // expanded in this bits/index, so one subtree emission is the final shape.
+  std::size_t segIndex = 0;
+  std::uint32_t ordinal = 0;
+  if (!locate(*anchorRow, segIndex, ordinal)) {
+    return errorResult(Status::InvalidNode, oldRevision, oldCount);
+  }
+  spliceExpand(anchor, segIndex, ordinal, bits, index);
+  bits_ = std::move(bits);
+  index_ = std::move(index);
+  ++revision_;
+  const RowCount inserted = rowCount_ - oldCount;
   return finishSplice(oldRevision, oldCount, *anchorRow + 1, 0, inserted, *anchorRow);
 }
 
