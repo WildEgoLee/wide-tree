@@ -263,6 +263,90 @@ ToggleUs measureRootToggle(widetree::TreeView& view, int trials) {
   return ToggleUs{medianOf(std::move(expandSamples)), medianOf(std::move(collapseSamples)), iters};
 }
 
+// Collapse then expand one visible node. The timers exclude rowOf and rowRef.
+// When `expectDrop` is non-zero, the warmup collapse must remove exactly that
+// many segments, so a "local" edit cannot silently become a root rebuild.
+ToggleUs measureIdToggle(widetree::TreeView& view, widetree::NodeId id, int trials,
+                          std::uint32_t expectDrop) {
+  auto restoreExpanded = [&] {
+    if (!view.isExpanded(id)) {
+      const auto row = view.rowOf(id);
+      if (!row) {
+        fail("restore row");
+      }
+      if (view.expandAt(*view.rowRef(*row)).status != widetree::Status::Ok) {
+        fail("restore expand");
+      }
+    }
+  };
+  restoreExpanded();
+  const std::uint32_t before = view.memory().segmentCount;
+  auto onePair = [&](double& collapseUs, double& expandUs, bool checkDrop) {
+    const auto rowDown = view.rowOf(id);
+    if (!rowDown) {
+      fail("row before collapse");
+    }
+    const auto down = *view.rowRef(*rowDown);
+    const auto c0 = Clock::now();
+    if (view.collapseAt(down).status != widetree::Status::Ok) {
+      fail("collapse");
+    }
+    collapseUs += usSince(c0);
+    if (checkDrop) {
+      const std::uint32_t mid = view.memory().segmentCount;
+      if (before < mid || before - mid != expectDrop) {
+        std::fprintf(stderr, "segments %u -> %u, expected drop %u\n", before, mid, expectDrop);
+        fail("edit changed the wrong number of segments");
+      }
+    }
+    const auto rowUp = view.rowOf(id);
+    if (!rowUp) {
+      fail("row before expand");
+    }
+    const auto up = *view.rowRef(*rowUp);
+    const auto e0 = Clock::now();
+    if (view.expandAt(up).status != widetree::Status::Ok) {
+      fail("expand");
+    }
+    expandUs += usSince(e0);
+    g_sink += view.rowCount();
+  };
+  {
+    double ignoreC = 0;
+    double ignoreE = 0;
+    onePair(ignoreC, ignoreE, expectDrop != 0);
+  }
+  const double probe = [&] {
+    double c = 0;
+    double e = 0;
+    const auto started = Clock::now();
+    onePair(c, e, false);
+    return usSince(started);
+  }();
+  int iters = probe <= 1.0 ? 2000 : static_cast<int>(6000.0 / probe);
+  if (iters < 6) {
+    iters = 6;
+  }
+  if (iters > 2000) {
+    iters = 2000;
+  }
+  std::vector<double> expandSamples;
+  std::vector<double> collapseSamples;
+  for (int trial = 0; trial < trials; ++trial) {
+    double collapseUs = 0;
+    double expandUs = 0;
+    for (int i = 0; i < iters; ++i) {
+      onePair(collapseUs, expandUs, false);
+    }
+    collapseSamples.push_back(collapseUs / static_cast<double>(iters));
+    expandSamples.push_back(expandUs / static_cast<double>(iters));
+  }
+  if (view.memory().segmentCount != before) {
+    fail("edit toggle did not restore S");
+  }
+  return ToggleUs{medianOf(std::move(expandSamples)), medianOf(std::move(collapseSamples)), iters};
+}
+
 struct Row {
   const char* shape = "";
   std::uint32_t n = 0;
@@ -291,6 +375,8 @@ void printHeader() {
   std::printf("# median of 5 trials. expand_us and collapse_us are the mutation only; rowRef is not included.\n");
   std::printf("# K is memory.expandedCount. In these shapes every expanded node is reachable.\n");
   std::printf("# S is memory.segmentCount. There is no rowAt(); rowRef is the row->node locate.\n");
+  std::printf("# edit-root toggles the root. edit-head/mid/tail toggle one expanded child;\n");
+  std::printf("# that child drops exactly two segments. All four still rebuild the whole projection.\n");
   std::puts(
       "shape\tN\tfanout\tK\tS\tindexParents\tbitmapB\tindexEstB\tsegmentB\tbuild_us\t"
       "rows64_us\trowRef_us\trowOf_us\tquery_iters\texpand_us\tcollapse_us\ttoggle_iters");
@@ -358,6 +444,48 @@ Row runChain(std::uint32_t nodes) {
   return row;
 }
 
+// Root plus one expanded child at the head, middle, and tail of a split
+// projection. S = 2 * (splits + 1). The local edit removes two segments;
+// the root edit removes almost all of them. Same tree, four timers.
+void runEdit(std::uint32_t fanout, std::uint32_t splits) {
+  Wide wide = makeWide(fanout, splits);
+  const auto memory = wide.view.memory();
+  const std::uint32_t step = fanout / splits;
+  const widetree::NodeId head = 1u;
+  const widetree::NodeId mid = 1u + (splits / 2u) * step;
+  const widetree::NodeId tail = 1u + (splits - 1u) * step;
+  const QueryUs query = measureQueries(wide.view, tail, 5);
+  const ToggleUs toggles[4] = {
+      measureRootToggle(wide.view, 5),
+      measureIdToggle(wide.view, head, 5, 2),
+      measureIdToggle(wide.view, mid, 5, 2),
+      measureIdToggle(wide.view, tail, 5, 2),
+  };
+  const char* shapes[4] = {"edit-root", "edit-head", "edit-mid", "edit-tail"};
+  if (wide.view.memory().segmentCount != memory.segmentCount) {
+    fail("edit shape did not restore S");
+  }
+  if (wide.view.checkInvariants() != nullptr) {
+    fail(wide.view.checkInvariants());
+  }
+  for (int i = 0; i < 4; ++i) {
+    Row row;
+    row.shape = shapes[i];
+    row.n = wide.snapshot->nodeCount();
+    row.fanout = fanout;
+    row.expanded = memory.expandedCount;
+    row.segments = memory.segmentCount;
+    row.indexedParents = memory.indexedParentCount;
+    row.bitmapBytes = memory.bitmapBytes;
+    row.indexEstimateBytes = memory.indexPayloadBytes + memory.indexNodeEstimateBytes;
+    row.segmentBytes = memory.segmentBytes + memory.prefixBytes;
+    row.buildUs = wide.buildUs;
+    row.query = query;
+    row.toggle = toggles[i];
+    printRow(row);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -381,6 +509,13 @@ int main() {
   const std::uint32_t chains[] = {250, 1000, 2500, 5000, 10000, 20000, 40000};
   for (std::uint32_t nodes : chains) {
     printRow(runChain(nodes));
+  }
+  // Where a two-segment edit sits. Fanout stays strictly above the split
+  // count so the root keeps a trailing run; S = 2*(splits+1): 8002, 32002, 128002.
+  const std::uint32_t editFanout[] = {100000, 100000, 128000};
+  const std::uint32_t editSplits[] = {4000, 16000, 64000};
+  for (int i = 0; i < 3; ++i) {
+    runEdit(editFanout[i], editSplits[i]);
   }
   std::printf("# sink %llu\n", static_cast<unsigned long long>(g_sink));
   return 0;

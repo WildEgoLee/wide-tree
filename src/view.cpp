@@ -1,6 +1,7 @@
 #include "widetree/view.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <utility>
 
 namespace widetree {
@@ -268,9 +269,16 @@ ViewResult TreeView::expandAt(RowRef ref) {
   if (parent != kInvalidNode) {
     insertOrdinal(index, parent, snap_->topology(id).rowInParent);
   }
-  Candidate candidate = candidateFrom(std::move(bits), std::move(index));
-  const RowCount inserted = candidate.rowCount - oldCount;
-  commit(candidate);
+  std::size_t segIndex = 0;
+  std::uint32_t ordinal = 0;
+  if (!locate(ref.row, segIndex, ordinal)) {
+    return errorResult(Status::InvalidRowRef, oldRevision, oldCount);
+  }
+  spliceExpand(id, segIndex, ordinal, bits, index);
+  bits_ = std::move(bits);
+  index_ = std::move(index);
+  ++revision_;
+  const RowCount inserted = rowCount_ - oldCount;
   return finishSplice(oldRevision, oldCount, ref.row + 1, 0, inserted, ref.row);
 }
 
@@ -292,9 +300,17 @@ ViewResult TreeView::collapseAt(RowRef ref) {
   if (parent != kInvalidNode) {
     eraseOrdinal(index, parent, snap_->topology(id).rowInParent);
   }
-  Candidate candidate = candidateFrom(std::move(bits), std::move(index));
-  const RowCount removed = oldCount - candidate.rowCount;
-  commit(candidate);
+  std::size_t segIndex = 0;
+  std::uint32_t ordinal = 0;
+  if (!locate(ref.row, segIndex, ordinal)) {
+    return errorResult(Status::InvalidRowRef, oldRevision, oldCount);
+  }
+  (void)ordinal;
+  spliceCollapse(segIndex);
+  bits_ = std::move(bits);
+  index_ = std::move(index);
+  ++revision_;
+  const RowCount removed = oldCount - rowCount_;
   return finishSplice(oldRevision, oldCount, ref.row + 1, removed, 0, ref.row);
 }
 
@@ -601,8 +617,6 @@ void TreeView::project(const ExpandBitmap& bits, const ExpandIndex& index,
   const NodeId root = snap_->root();
   std::uint32_t rootOrdinalStorage = 0;
 
-  std::vector<Frame> stack;
-  stack.reserve(64);
   Frame top{};
   top.segmentParent = kDisplayRoot;
   top.depth = 0;
@@ -618,6 +632,13 @@ void TreeView::project(const ExpandBitmap& bits, const ExpandIndex& index,
     top.ords = ordinalsOf(index, root, count);
     top.ordCount = count;
   }
+  emitExpanded(bits, index, top, out);
+}
+
+void TreeView::emitExpanded(const ExpandBitmap& bits, const ExpandIndex& index, Frame top,
+                            std::vector<Segment>& out) const {
+  std::vector<Frame> stack;
+  stack.reserve(64);
   stack.push_back(top);
 
   while (!stack.empty()) {
@@ -658,6 +679,81 @@ void TreeView::project(const ExpandBitmap& bits, const ExpandIndex& index,
     childFrame.ordCount = count;
     stack.push_back(childFrame);
   }
+}
+
+void TreeView::rebuildPrefixFrom(std::size_t seg) {
+  prefix_.resize(segments_.size() + 1);
+  RowIndex row = 0;
+  if (seg > 0) {
+    row = prefix_[seg];
+  } else {
+    prefix_[0] = 0;
+  }
+  if (seg > segments_.size()) {
+    seg = segments_.size();
+  }
+  for (std::size_t i = seg; i < segments_.size(); ++i) {
+    prefix_[i] = row;
+    row += static_cast<RowCount>(segments_[i].end) - static_cast<RowCount>(segments_[i].begin);
+  }
+  prefix_[segments_.size()] = row;
+  rowCount_ = row;
+}
+
+void TreeView::spliceExpand(NodeId id, std::size_t segIndex, std::uint32_t ordinal,
+                            const ExpandBitmap& bits, const ExpandIndex& index) {
+  const Segment hostBefore = segments_[segIndex];
+  Segment host = hostBefore;
+  host.end = ordinal + 1;
+  segments_[segIndex] = host;
+
+  Frame top{};
+  top.segmentParent = id;
+  top.depth = hostBefore.depth + 1;
+  top.childCount = snap_->topology(id).childCount;
+  std::uint32_t count = 0;
+  top.ords = ordinalsOf(index, id, count);
+  top.ordCount = count;
+
+  std::vector<Segment> extra;
+  emitExpanded(bits, index, top, extra);
+  const bool hasRight = ordinal + 1 < hostBefore.end;
+  if (hasRight) {
+    extra.push_back(Segment{hostBefore.parent, ordinal + 1, hostBefore.end, hostBefore.depth});
+  }
+  if (!extra.empty()) {
+    segments_.insert(segments_.begin() + static_cast<std::ptrdiff_t>(segIndex + 1), extra.begin(),
+                     extra.end());
+  }
+  rebuildPrefixFrom(segIndex);
+}
+
+void TreeView::spliceCollapse(std::size_t segIndex) {
+  // The unhidden root is segment 0 by itself, so its descendants are the
+  // whole suffix. Dropping that suffix is a size change, not a scan.
+  if (segIndex == 0 && !hideRoot_) {
+    segments_.resize(1);
+    rebuildPrefixFrom(0);
+    return;
+  }
+  const std::uint32_t depth = segments_[segIndex].depth;
+  std::size_t end = segIndex + 1;
+  while (end < segments_.size() && segments_[end].depth > depth) {
+    ++end;
+  }
+  if (end > segIndex + 1) {
+    segments_.erase(segments_.begin() + static_cast<std::ptrdiff_t>(segIndex + 1),
+                    segments_.begin() + static_cast<std::ptrdiff_t>(end));
+  }
+  if (segIndex + 1 < segments_.size()) {
+    Segment& cur = segments_[segIndex];
+    const Segment& next = segments_[segIndex + 1];
+    if (cur.parent == next.parent && cur.depth == next.depth && cur.end == next.begin) {
+      cur.end = next.end;
+      segments_.erase(segments_.begin() + static_cast<std::ptrdiff_t>(segIndex + 1));
+    }
+  }
+  rebuildPrefixFrom(segIndex);
 }
 
 void TreeView::buildPrefix(const std::vector<Segment>& segments,

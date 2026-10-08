@@ -136,6 +136,17 @@ class TreeView {
   bool locate(RowIndex row, std::size_t& segmentIndex, std::uint32_t& ordinal) const;
   void project(const ExpandBitmap& bits, const ExpandIndex& index,
                std::vector<Segment>& out) const;
+  void emitExpanded(const ExpandBitmap& bits, const ExpandIndex& index, Frame top,
+                    std::vector<Segment>& out) const;
+  void rebuildPrefixFrom(std::size_t seg);
+  // Insert the expanded node's descendant segments after its row, splitting the
+  // host run so the node stays its last row. The suffix of the segment array
+  // is moved, not rebuilt.
+  void spliceExpand(NodeId id, std::size_t segIndex, std::uint32_t ordinal,
+                    const ExpandBitmap& bits, const ExpandIndex& index);
+  // Drop the contiguous deeper segments that follow an expanded node, then
+  // merge the host run with the sibling run that was sitting behind them.
+  void spliceCollapse(std::size_t segIndex);
   static void buildPrefix(const std::vector<Segment>& segments,
                           std::vector<RowIndex>& prefix, RowCount& rowCount);
   static const ParentSpan* findSpan(const ExpandIndex& index, NodeId parent);
