@@ -1,6 +1,6 @@
 //! Immutable topology snapshot.
 
-use crate::types::{NodeId, K_INVALID_NODE};
+use crate::types::NodeId;
 use std::sync::Arc;
 
 /// 16 bytes equivalent. One record per node, indexed by NodeId.
