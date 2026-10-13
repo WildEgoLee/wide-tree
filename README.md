@@ -4,15 +4,12 @@ This branch contains a Rust port of the immutable ultra-wide tree visible-row pr
 
 ## Status
 
-- Core types, `TreeSnapshot`, and `TreeBuilder` are ported with the same validation rules (id range, single parent, cycles, reachability, label bounds).
-- `TreeView` implements the observable v1 contract:
-  - `reset`, `expand_at`, `collapse_at`, `reveal`
-  - `get_visible_rows`, `row_of`, `is_visible`, `is_expanded`, `row_ref`
-  - `RowRef` staleness checks
-  - Segment array + prefix rebuilt from the expand bitmap (full re-projection for correctness)
-- Tests: `tests/smoke.rs` + `tests/acceptance.rs` (wide fan-out, hide-root mode). All pass under `cargo test`.
+- Core types, `TreeSnapshot`, and `TreeBuilder` are ported with the same validation rules.
+- `TreeView` implements the observable v1 contract.
+- **Incremental splice**: `expand_at` and `collapse_at` now use `spliceExpand` / `spliceCollapse` (split host segment, emit/remove subtree, merge adjacent runs). `reveal` still falls back to full rebuild.
+- Tests: `tests/smoke.rs` + `tests/acceptance.rs` (wide fan-out, hide-root, repeated expand/collapse stability). All pass under `cargo test`.
 
-Partial splice (only updating the affected suffix of the segment array) and the sparse parent index from the C++ implementation are not yet present. Full re-projection is correct but not the asymptotic optimum for large S. The C++ code on `main` remains the performance reference.
+Sparse parent index is not yet present. The C++ code on `main` remains the performance reference for the optimized path.
 
 ## Build & test
 
@@ -23,15 +20,15 @@ cargo build --release
 
 ## Design notes
 
-- Snapshot is `Arc<TreeSnapshot>` (shared, immutable).
+- Snapshot is `Arc<TreeSnapshot>`.
 - Expand preference lives in a bitmap owned by the view.
-- Segment array and prefix are rebuilt on expand/collapse/reveal to match the contract's emission order.
+- Segment array is updated incrementally on expand/collapse; prefix is rebuilt from the change point.
 
 ## Next steps
 
-1. Incremental segment splice (`spliceExpand` / `spliceCollapse`) to avoid full rebuilds.
+1. Make `reveal` also incremental (or share the same splice path).
 2. Sparse parent index for faster restore on large expanded sets.
-3. Larger acceptance tests (closer to 1M children, segment stability under repeated expand/collapse).
+3. Larger acceptance tests (closer to 1M children).
 4. Criterion benchmarks.
 
 The original C++ sources stay on `main` for comparison.
