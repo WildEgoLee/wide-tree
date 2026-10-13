@@ -10,7 +10,7 @@ This branch contains a Rust port of the immutable ultra-wide tree visible-row pr
   - `get_visible_rows`, `row_of`, `is_visible`, `is_expanded`, `row_ref`
   - `RowRef` staleness checks
   - Segment array + prefix rebuilt from the expand bitmap (full re-projection for correctness)
-- Basic smoke tests in `tests/smoke.rs`.
+- Tests: `tests/smoke.rs` + `tests/acceptance.rs` (wide fan-out, hide-root mode). All pass under `cargo test`.
 
 Partial splice (only updating the affected suffix of the segment array) and the sparse parent index from the C++ implementation are not yet present. Full re-projection is correct but not the asymptotic optimum for large S. The C++ code on `main` remains the performance reference.
 
@@ -31,7 +31,7 @@ cargo build --release
 
 1. Incremental segment splice (`spliceExpand` / `spliceCollapse`) to avoid full rebuilds.
 2. Sparse parent index for faster restore on large expanded sets.
-3. Acceptance tests matching the C++ suite (1M children, segment stability, jump to row 800000).
+3. Larger acceptance tests (closer to 1M children, segment stability under repeated expand/collapse).
 4. Criterion benchmarks.
 
 The original C++ sources stay on `main` for comparison.
