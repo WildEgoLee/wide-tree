@@ -5,8 +5,7 @@
 //!
 //! This version implements the observable contract (reset, expand/collapse/reveal,
 //! getVisibleRows, rowOf, isVisible, RowRef validity).
-//! expand_at and collapse_at use incremental spliceExpand / spliceCollapse.
-//! reveal still falls back to full rebuild. Sparse index is not yet present.
+//! expand_at, collapse_at and reveal all use incremental splice. Sparse index is not yet present.
 
 use crate::snapshot::TreeSnapshot;
 use crate::types::*;
@@ -185,7 +184,9 @@ impl TreeView {
         let Some(snap) = &self.snap else { return self.error(Status::NoSnapshot); };
         if !snap.contains(id) || (self.hide_root && id == snap.root()) { return self.error(Status::InvalidNode); }
         if self.is_visible(id) { return self.no_change(); }
-        let mut to_expand = Vec::new(); let mut cur = id; let root = snap.root();
+        let mut to_expand = Vec::new();
+        let mut cur = id;
+        let root = snap.root();
         for _ in 0..snap.node_count() + 1 {
             let parent = snap.topology(cur).parent;
             if parent == K_INVALID_NODE || !snap.contains(parent) { break; }
@@ -196,10 +197,18 @@ impl TreeView {
         }
         if to_expand.is_empty() { return self.no_change(); }
         let anchor = *to_expand.last().unwrap();
-        let anchor_row = self.row_of(anchor).ok_or(Status::InvalidNode).unwrap_or(0);
-        let old_rev = self.revision; let old_count = self.row_count;
+        let anchor_row = match self.row_of(anchor) {
+            Some(r) => r,
+            None => return self.error(Status::InvalidNode),
+        };
+        let old_rev = self.revision;
+        let old_count = self.row_count;
         for &node in &to_expand { self.bits.set(node); }
-        self.rebuild_projection();
+        if let Some((seg_idx, ordinal)) = self.locate(anchor_row) {
+            self.splice_expand(anchor, seg_idx, ordinal);
+        } else {
+            self.rebuild_projection();
+        }
         self.revision += 1;
         let inserted = self.row_count.saturating_sub(old_count);
         self.finish_splice(old_rev, old_count, anchor_row + 1, 0, inserted, anchor_row)
