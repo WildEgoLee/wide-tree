@@ -1,0 +1,16 @@
+[package]
+name = "wide-tree"
+version = "0.1.0"
+edition = "2021"
+description = "Immutable snapshot ultra-wide tree visible row projection (Rust port)"
+license = "MIT"
+authors = ["WildEgoLee"]
+
+[dependencies]
+# No external deps for core; pure std
+
+[dev-dependencies]
+
+[lib]
+name = "wide_tree"
+path = "src/lib.rs"
