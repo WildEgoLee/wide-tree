@@ -90,3 +90,21 @@ fn reveal_makes_deep_node_visible() {
     assert!(!view.is_expanded(2));
     assert!(view.check_invariants().is_none());
 }
+
+#[test]
+fn sparse_index_populated_on_expand() {
+    let mut b = TreeBuilder::new(5);
+    b.set_root(0);
+    b.add_child_range(0, 1, 3);
+    b.add_edge(1, 4);
+    let snap = b.build().snapshot.unwrap();
+    let mut view = TreeView::new();
+    view.reset(snap, ViewConfig::default());
+    let r = view.row_ref(0).unwrap();
+    view.expand_at(r);
+    let child = view.row_ref(1).unwrap();
+    view.expand_at(child);
+    let mem = view.memory();
+    assert!(mem.indexed_parent_count >= 1);
+    assert!(mem.index_payload_bytes > 0);
+}
