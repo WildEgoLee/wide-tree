@@ -11,5 +11,5 @@ pub mod view;
 
 pub use types::*;
 pub use snapshot::TreeSnapshot;
-pub use builder::{TreeBuilder, BuildResult, BuildError};
-pub use view::{TreeView, ViewConfig, ViewResult};
+pub use builder::{TreeBuilder, BuildResult};
+pub use view::{TreeView, ViewConfig};
