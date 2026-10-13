@@ -3,9 +3,8 @@
 //! Authoritative data is the expanded bitmap.
 //! Segment array + prefix represents the currently visible structure.
 //!
-//! This version implements the observable contract (reset, expand/collapse/reveal,
-//! getVisibleRows, rowOf, isVisible, RowRef validity).
-//! expand_at, collapse_at and reveal all use incremental splice. Sparse index is not yet present.
+//! expand_at, collapse_at and reveal all use incremental splice.
+//! Sparse index (parent spans + ordinals) accelerates restore.
 
 use crate::snapshot::TreeSnapshot;
 use crate::types::*;
@@ -54,11 +53,70 @@ impl ExpandBitmap {
     fn bytes(&self) -> u64 { self.words.len() as u64 * 8 }
 }
 
+#[derive(Debug, Clone)]
+struct ParentSpan {
+    parent: NodeId,
+    begin: u32,
+    count: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExpandIndex {
+    parents: Vec<ParentSpan>,
+    ordinals: Vec<u32>,
+}
+
+impl ExpandIndex {
+    fn find(&self, parent: NodeId) -> Option<usize> {
+        self.parents.binary_search_by_key(&parent, |s| s.parent).ok()
+    }
+    fn expanded_ordinals(&self, parent: NodeId) -> &[u32] {
+        if let Some(i) = self.find(parent) {
+            let s = &self.parents[i];
+            &self.ordinals[s.begin as usize..s.begin as usize + s.count as usize]
+        } else { &[] }
+    }
+    fn insert_ordinal(&mut self, parent: NodeId, ordinal: u32) {
+        if let Some(i) = self.find(parent) {
+            let begin = self.parents[i].begin as usize;
+            let count = self.parents[i].count as usize;
+            if let Err(pos) = self.ordinals[begin..begin + count].binary_search(&ordinal) {
+                self.ordinals.insert(begin + pos, ordinal);
+                self.parents[i].count += 1;
+                for s in self.parents.iter_mut().skip(i + 1) { s.begin += 1; }
+            }
+        } else {
+            self.ordinals.push(ordinal);
+            let pos = self.parents.partition_point(|s| s.parent < parent);
+            self.parents.insert(pos, ParentSpan { parent, begin: 0, count: 1 });
+            let mut cursor = 0u32;
+            for s in &mut self.parents { s.begin = cursor; cursor += s.count; }
+        }
+    }
+    fn erase_ordinal(&mut self, parent: NodeId, ordinal: u32) {
+        if let Some(i) = self.find(parent) {
+            let begin = self.parents[i].begin as usize;
+            let count = self.parents[i].count as usize;
+            if let Ok(pos) = self.ordinals[begin..begin + count].binary_search(&ordinal) {
+                self.ordinals.remove(begin + pos);
+                self.parents[i].count -= 1;
+                if self.parents[i].count == 0 { self.parents.remove(i); }
+                let mut cursor = 0u32;
+                for s in &mut self.parents { s.begin = cursor; cursor += s.count; }
+            }
+        }
+    }
+    fn bytes(&self) -> u64 {
+        (self.parents.len() * std::mem::size_of::<ParentSpan>() + self.ordinals.len() * 4) as u64
+    }
+}
+
 pub struct TreeView {
     snap: Option<Arc<TreeSnapshot>>,
     hide_root: bool,
     revision: u64,
     bits: ExpandBitmap,
+    index: ExpandIndex,
     segments: Vec<Segment>,
     prefix: Vec<RowIndex>,
     row_count: RowCount,
@@ -68,7 +126,11 @@ impl Default for TreeView { fn default() -> Self { Self::new() } }
 
 impl TreeView {
     pub fn new() -> Self {
-        Self { snap: None, hide_root: false, revision: 0, bits: ExpandBitmap::new(0), segments: Vec::new(), prefix: Vec::new(), row_count: 0 }
+        Self {
+            snap: None, hide_root: false, revision: 0,
+            bits: ExpandBitmap::new(0), index: ExpandIndex::default(),
+            segments: Vec::new(), prefix: Vec::new(), row_count: 0,
+        }
     }
 
     pub fn reset(&mut self, snapshot: Arc<TreeSnapshot>, config: ViewConfig) -> ViewResult {
@@ -76,6 +138,7 @@ impl TreeView {
         self.snap = Some(snapshot); self.hide_root = config.hide_root;
         let nc = self.snap.as_ref().unwrap().node_count();
         self.bits = ExpandBitmap::new(nc);
+        self.index = ExpandIndex::default();
         self.rebuild_projection();
         self.revision = old_rev + 1;
         ViewResult { status: Status::Ok, change: ProjectionChange { old_revision: old_rev, new_revision: self.revision, old_row_count: old_count, new_row_count: self.row_count, kind: ChangeKind::Reset, splice: RowSplice { first: 0, removed: old_count, inserted: self.row_count }, icon_rows: Vec::new() } }
@@ -159,6 +222,10 @@ impl TreeView {
         if snap.topology(id).child_count == 0 || self.bits.test(id) { return self.no_change(); }
         let old_rev = self.revision; let old_count = self.row_count;
         self.bits.set(id);
+        let parent = snap.topology(id).parent;
+        if parent != K_INVALID_NODE {
+            self.index.insert_ordinal(parent, snap.topology(id).row_in_parent);
+        }
         if let Some((seg_idx, ordinal)) = self.locate(r.row) {
             self.splice_expand(id, seg_idx, ordinal);
         } else { self.rebuild_projection(); }
@@ -172,6 +239,10 @@ impl TreeView {
         if !self.bits.test(id) { return self.no_change(); }
         let old_rev = self.revision; let old_count = self.row_count;
         self.bits.clear(id);
+        let parent = self.snap.as_ref().unwrap().topology(id).parent;
+        if parent != K_INVALID_NODE {
+            self.index.erase_ordinal(parent, self.snap.as_ref().unwrap().topology(id).row_in_parent);
+        }
         if let Some((seg_idx, _)) = self.locate(r.row) {
             self.splice_collapse(seg_idx);
         } else { self.rebuild_projection(); }
@@ -201,14 +272,17 @@ impl TreeView {
             Some(r) => r,
             None => return self.error(Status::InvalidNode),
         };
-        let old_rev = self.revision;
-        let old_count = self.row_count;
-        for &node in &to_expand { self.bits.set(node); }
+        let old_rev = self.revision; let old_count = self.row_count;
+        for &node in &to_expand {
+            self.bits.set(node);
+            let parent = snap.topology(node).parent;
+            if parent != K_INVALID_NODE {
+                self.index.insert_ordinal(parent, snap.topology(node).row_in_parent);
+            }
+        }
         if let Some((seg_idx, ordinal)) = self.locate(anchor_row) {
             self.splice_expand(anchor, seg_idx, ordinal);
-        } else {
-            self.rebuild_projection();
-        }
+        } else { self.rebuild_projection(); }
         self.revision += 1;
         let inserted = self.row_count.saturating_sub(old_count);
         self.finish_splice(old_rev, old_count, anchor_row + 1, 0, inserted, anchor_row)
@@ -229,6 +303,8 @@ impl TreeView {
             prefix_bytes: (self.prefix.len() * std::mem::size_of::<RowIndex>()) as u64,
             segment_count: self.segments.len() as u32,
             expanded_count: self.bits.count,
+            index_payload_bytes: self.index.bytes(),
+            indexed_parent_count: self.index.parents.len() as u32,
             ..Default::default()
         }
     }
@@ -306,9 +382,18 @@ impl TreeView {
         let child_count = self.snap.as_ref().unwrap().topology(parent).child_count;
         if child_count == 0 { return; }
         let mut expanded = Vec::new();
-        for ord in 0..child_count {
-            let child = self.snap.as_ref().unwrap().child(parent, ord);
-            if self.bits.test(child) { expanded.push((ord, child)); }
+        let ords = self.index.expanded_ordinals(parent);
+        if !ords.is_empty() {
+            for &ord in ords {
+                if ord < child_count {
+                    expanded.push((ord, self.snap.as_ref().unwrap().child(parent, ord)));
+                }
+            }
+        } else {
+            for ord in 0..child_count {
+                let child = self.snap.as_ref().unwrap().child(parent, ord);
+                if self.bits.test(child) { expanded.push((ord, child)); }
+            }
         }
         let mut begin = 0u32;
         for &(ord, child) in &expanded {
@@ -352,9 +437,18 @@ impl TreeView {
         let child_count = self.snap.as_ref().unwrap().topology(parent).child_count;
         if child_count == 0 { return; }
         let mut expanded = Vec::new();
-        for ord in 0..child_count {
-            let child = self.snap.as_ref().unwrap().child(parent, ord);
-            if self.bits.test(child) { expanded.push((ord, child)); }
+        let ords = self.index.expanded_ordinals(parent);
+        if !ords.is_empty() {
+            for &ord in ords {
+                if ord < child_count {
+                    expanded.push((ord, self.snap.as_ref().unwrap().child(parent, ord)));
+                }
+            }
+        } else {
+            for ord in 0..child_count {
+                let child = self.snap.as_ref().unwrap().child(parent, ord);
+                if self.bits.test(child) { expanded.push((ord, child)); }
+            }
         }
         let mut begin = 0u32;
         for &(ord, child) in &expanded {
