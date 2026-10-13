@@ -532,20 +532,26 @@ impl TreeView {
     }
 
     fn emit_expanded(&mut self, parent: NodeId, child_depth: u32) {
-        let snap = self.snap.as_ref().unwrap();
-        let child_count = snap.topology(parent).child_count;
+        let child_count = {
+            let snap = self.snap.as_ref().unwrap();
+            snap.topology(parent).child_count
+        };
         if child_count == 0 {
             return;
         }
+        // Collect expanded (ordinal, child) pairs first to avoid holding borrows.
         let mut expanded = Vec::new();
         for ord in 0..child_count {
-            let child = snap.child(parent, ord);
+            let child = {
+                let snap = self.snap.as_ref().unwrap();
+                snap.child(parent, ord)
+            };
             if self.bits.test(child) {
-                expanded.push(ord);
+                expanded.push((ord, child));
             }
         }
         let mut begin = 0u32;
-        for &ord in &expanded {
+        for &(ord, child) in &expanded {
             if begin <= ord {
                 self.segments.push(Segment {
                     parent,
@@ -554,7 +560,6 @@ impl TreeView {
                     depth: child_depth,
                 });
             }
-            let child = snap.child(parent, ord);
             self.emit_expanded(child, child_depth + 1);
             begin = ord + 1;
         }
