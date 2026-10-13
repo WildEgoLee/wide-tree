@@ -4,14 +4,11 @@ use wide_tree::{TreeBuilder, TreeView, ViewConfig, Status};
 
 #[test]
 fn wide_fanout_expand_and_jump() {
-    // root + 1000 direct children (modest stand-in for 1M)
     let n = 1001u32;
     let mut b = TreeBuilder::new(n);
     b.set_root(0);
     b.add_child_range(0, 1, 1000);
-    for i in 0..n {
-        b.set_label(i, &format!("n{i}"));
-    }
+    for i in 0..n { b.set_label(i, &format!("n{i}")); }
     let snap = b.build().snapshot.expect("build");
 
     let mut view = TreeView::new();
@@ -21,9 +18,8 @@ fn wide_fanout_expand_and_jump() {
     let root = view.row_ref(0).unwrap();
     let exp = view.expand_at(root);
     assert_eq!(exp.status, Status::Ok);
-    assert_eq!(view.row_count(), 1001); // root + 1000 children
+    assert_eq!(view.row_count(), 1001);
 
-    // Jump near the end
     let mut buf = vec![wide_tree::VisibleRow {
         row: 0, id: 0, depth: 0, ordinal_in_parent: 0,
         child_count: 0, expanded: false, label: String::new(), payload: 0,
@@ -32,7 +28,6 @@ fn wide_fanout_expand_and_jump() {
     assert!(got > 0);
     assert_eq!(buf[0].id, 990);
 
-    // Collapse restores
     let root2 = view.row_ref(0).unwrap();
     let col = view.collapse_at(root2);
     assert_eq!(col.status, Status::Ok);
@@ -49,8 +44,28 @@ fn hide_root_mode() {
 
     let mut view = TreeView::new();
     view.reset(snap, ViewConfig { hide_root: true });
-    // children of root become depth-0 rows
     assert_eq!(view.row_count(), 3);
     assert!(view.is_visible(1));
     assert!(!view.is_visible(0));
+}
+
+#[test]
+fn repeated_expand_collapse_stable() {
+    let mut b = TreeBuilder::new(5);
+    b.set_root(0);
+    b.add_child_range(0, 1, 4);
+    let snap = b.build().snapshot.unwrap();
+
+    let mut view = TreeView::new();
+    view.reset(snap, ViewConfig::default());
+
+    for _ in 0..10 {
+        let r = view.row_ref(0).expect("root row");
+        view.expand_at(r);
+        assert!(view.row_count() > 1);
+        let r = view.row_ref(0).expect("root row");
+        view.collapse_at(r);
+        assert_eq!(view.row_count(), 1);
+    }
+    assert!(view.check_invariants().is_none());
 }
