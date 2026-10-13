@@ -24,9 +24,10 @@ pub enum Status {
     StaleSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ChangeKind {
+    #[default]
     NoChange = 0,
     Splice,
     Reset,
