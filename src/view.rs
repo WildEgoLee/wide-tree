@@ -4,7 +4,7 @@
 //! Segment array + prefix represents the currently visible structure.
 //!
 //! expand_at, collapse_at and reveal all use incremental splice.
-//! Sparse index (parent spans + ordinals) accelerates restore.
+//! Sparse index (parent spans + ordinals + open-addressed lookup) accelerates restore.
 
 use crate::snapshot::TreeSnapshot;
 use crate::types::*;
@@ -64,18 +64,56 @@ struct ParentSpan {
 struct ExpandIndex {
     parents: Vec<ParentSpan>,
     ordinals: Vec<u32>,
+    hash_keys: Vec<NodeId>,
+    hash_vals: Vec<u32>,
 }
 
 impl ExpandIndex {
-    fn find(&self, parent: NodeId) -> Option<usize> {
-        self.parents.binary_search_by_key(&parent, |s| s.parent).ok()
+    fn rehash(&mut self) {
+        let n = self.parents.len();
+        if n == 0 {
+            self.hash_keys.clear();
+            self.hash_vals.clear();
+            return;
+        }
+        let mut cap = 1usize;
+        let need = n * 2;
+        while cap < need { cap <<= 1; }
+        self.hash_keys = vec![K_INVALID_NODE; cap];
+        self.hash_vals = vec![0; cap];
+        let mask = cap - 1;
+        for (i, span) in self.parents.iter().enumerate() {
+            let mut slot = ((span.parent as u64).wrapping_mul(0x9E3779B1) as usize) & mask;
+            while self.hash_keys[slot] != K_INVALID_NODE {
+                slot = (slot + 1) & mask;
+            }
+            self.hash_keys[slot] = span.parent;
+            self.hash_vals[slot] = i as u32;
+        }
     }
+
+    fn find(&self, parent: NodeId) -> Option<usize> {
+        if self.hash_keys.is_empty() {
+            return self.parents.binary_search_by_key(&parent, |s| s.parent).ok();
+        }
+        let mask = self.hash_keys.len() - 1;
+        let mut slot = ((parent as u64).wrapping_mul(0x9E3779B1) as usize) & mask;
+        for _ in 0..self.hash_keys.len() {
+            let k = self.hash_keys[slot];
+            if k == K_INVALID_NODE { return None; }
+            if k == parent { return Some(self.hash_vals[slot] as usize); }
+            slot = (slot + 1) & mask;
+        }
+        None
+    }
+
     fn expanded_ordinals(&self, parent: NodeId) -> &[u32] {
         if let Some(i) = self.find(parent) {
             let s = &self.parents[i];
             &self.ordinals[s.begin as usize..s.begin as usize + s.count as usize]
         } else { &[] }
     }
+
     fn insert_ordinal(&mut self, parent: NodeId, ordinal: u32) {
         if let Some(i) = self.find(parent) {
             let begin = self.parents[i].begin as usize;
@@ -91,8 +129,10 @@ impl ExpandIndex {
             self.parents.insert(pos, ParentSpan { parent, begin: 0, count: 1 });
             let mut cursor = 0u32;
             for s in &mut self.parents { s.begin = cursor; cursor += s.count; }
+            self.rehash();
         }
     }
+
     fn erase_ordinal(&mut self, parent: NodeId, ordinal: u32) {
         if let Some(i) = self.find(parent) {
             let begin = self.parents[i].begin as usize;
@@ -103,11 +143,16 @@ impl ExpandIndex {
                 if self.parents[i].count == 0 { self.parents.remove(i); }
                 let mut cursor = 0u32;
                 for s in &mut self.parents { s.begin = cursor; cursor += s.count; }
+                self.rehash();
             }
         }
     }
+
     fn bytes(&self) -> u64 {
-        (self.parents.len() * std::mem::size_of::<ParentSpan>() + self.ordinals.len() * 4) as u64
+        (self.parents.len() * std::mem::size_of::<ParentSpan>()
+            + self.ordinals.len() * 4
+            + self.hash_keys.len() * 4
+            + self.hash_vals.len() * 4) as u64
     }
 }
 
