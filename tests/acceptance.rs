@@ -69,3 +69,24 @@ fn repeated_expand_collapse_stable() {
     }
     assert!(view.check_invariants().is_none());
 }
+
+#[test]
+fn reveal_makes_deep_node_visible() {
+    let mut b = TreeBuilder::new(3);
+    b.set_root(0);
+    b.add_edge(0, 1);
+    b.add_edge(1, 2);
+    let snap = b.build().snapshot.unwrap();
+
+    let mut view = TreeView::new();
+    view.reset(snap, ViewConfig::default());
+    assert!(!view.is_visible(2));
+
+    let res = view.reveal(2);
+    assert_eq!(res.status, Status::Ok);
+    assert!(view.is_visible(2));
+    assert!(view.is_expanded(0));
+    assert!(view.is_expanded(1));
+    assert!(!view.is_expanded(2));
+    assert!(view.check_invariants().is_none());
+}
