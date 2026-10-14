@@ -4,7 +4,7 @@
 //! Segment array + prefix represents the currently visible structure.
 //!
 //! expand_at, collapse_at and reveal all use incremental splice.
-//! Sparse index (parent spans + ordinals + open-addressed lookup) accelerates restore.
+//! Sparse index uses Arc + copy-on-write: unmodified parents share the payload until first edit.
 
 use crate::snapshot::TreeSnapshot;
 use crate::types::*;
@@ -161,7 +161,7 @@ pub struct TreeView {
     hide_root: bool,
     revision: u64,
     bits: ExpandBitmap,
-    index: ExpandIndex,
+    index: Arc<ExpandIndex>,
     segments: Vec<Segment>,
     prefix: Vec<RowIndex>,
     row_count: RowCount,
@@ -173,7 +173,7 @@ impl TreeView {
     pub fn new() -> Self {
         Self {
             snap: None, hide_root: false, revision: 0,
-            bits: ExpandBitmap::new(0), index: ExpandIndex::default(),
+            bits: ExpandBitmap::new(0), index: Arc::new(ExpandIndex::default()),
             segments: Vec::new(), prefix: Vec::new(), row_count: 0,
         }
     }
@@ -183,7 +183,7 @@ impl TreeView {
         self.snap = Some(snapshot); self.hide_root = config.hide_root;
         let nc = self.snap.as_ref().unwrap().node_count();
         self.bits = ExpandBitmap::new(nc);
-        self.index = ExpandIndex::default();
+        self.index = Arc::new(ExpandIndex::default());
         self.rebuild_projection();
         self.revision = old_rev + 1;
         ViewResult { status: Status::Ok, change: ProjectionChange { old_revision: old_rev, new_revision: self.revision, old_row_count: old_count, new_row_count: self.row_count, kind: ChangeKind::Reset, splice: RowSplice { first: 0, removed: old_count, inserted: self.row_count }, icon_rows: Vec::new() } }
@@ -268,8 +268,9 @@ impl TreeView {
         let old_rev = self.revision; let old_count = self.row_count;
         self.bits.set(id);
         let parent = snap.topology(id).parent;
+        let ordinal = snap.topology(id).row_in_parent;
         if parent != K_INVALID_NODE {
-            self.index.insert_ordinal(parent, snap.topology(id).row_in_parent);
+            self.write_index().insert_ordinal(parent, ordinal);
         }
         if let Some((seg_idx, ordinal)) = self.locate(r.row) {
             self.splice_expand(id, seg_idx, ordinal);
@@ -285,8 +286,9 @@ impl TreeView {
         let old_rev = self.revision; let old_count = self.row_count;
         self.bits.clear(id);
         let parent = self.snap.as_ref().unwrap().topology(id).parent;
+        let ordinal = self.snap.as_ref().unwrap().topology(id).row_in_parent;
         if parent != K_INVALID_NODE {
-            self.index.erase_ordinal(parent, self.snap.as_ref().unwrap().topology(id).row_in_parent);
+            self.write_index().erase_ordinal(parent, ordinal);
         }
         if let Some((seg_idx, _)) = self.locate(r.row) {
             self.splice_collapse(seg_idx);
@@ -321,8 +323,9 @@ impl TreeView {
         for &node in &to_expand {
             self.bits.set(node);
             let parent = snap.topology(node).parent;
+            let ordinal = snap.topology(node).row_in_parent;
             if parent != K_INVALID_NODE {
-                self.index.insert_ordinal(parent, snap.topology(node).row_in_parent);
+                self.write_index().insert_ordinal(parent, ordinal);
             }
         }
         if let Some((seg_idx, ordinal)) = self.locate(anchor_row) {
@@ -366,6 +369,14 @@ impl TreeView {
         }
         if expect != self.row_count { return Some("row count"); }
         None
+    }
+
+    /// Unshare the index payload if it is currently shared (copy-on-write).
+    fn write_index(&mut self) -> &mut ExpandIndex {
+        if Arc::strong_count(&self.index) != 1 {
+            self.index = Arc::new((*self.index).clone());
+        }
+        Arc::get_mut(&mut self.index).unwrap()
     }
 
     fn error(&self, status: Status) -> ViewResult {
